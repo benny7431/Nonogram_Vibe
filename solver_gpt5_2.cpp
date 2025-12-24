@@ -721,6 +721,10 @@ static void read_vector(ifstream& in, vector<int>& vec) {
 }
 
 static void write_state(ofstream& out, const NonogramSolver::State& state) {
+    uint32_t magic = 0x4e4f4e4f; // "NONO"
+    uint32_t version = 1;
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(uint32_t));
+    out.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
     write_vector(out, state.row_must1);
     write_vector(out, state.row_must0);
     write_vector(out, state.col_must1);
@@ -748,6 +752,11 @@ static void write_state(ofstream& out, const NonogramSolver::State& state) {
 
 static bool read_state(ifstream& in, NonogramSolver::State& state) {
     if (!in.good()) return false;
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    in.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
+    in.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+    if (!in.good() || magic != 0x4e4f4e4f || version != 1) return false;
     read_vector(in, state.row_must1);
     read_vector(in, state.row_must0);
     read_vector(in, state.col_must1);
