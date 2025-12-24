@@ -5,8 +5,7 @@ import os
 import platform
 
 # 設定要執行的檔案 (可以是 .py 或 .cpp)
-SOLVER_FILE = 'solver - GPT5.2.py'
-#SOLVER_FILE = 'nonogram_solver.cpp'
+SOLVER_FILE = 'solver - GPT5.2.cpp'
 TIME_LIMIT_SECONDS = 120  
 
 # 編譯 C++ 程式
