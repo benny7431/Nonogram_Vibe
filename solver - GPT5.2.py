@@ -551,15 +551,13 @@ def checkpoint_path(checkpoint_dir, pid):
 def main():
     parser = argparse.ArgumentParser(description="Nonogram solver with time slicing + checkpoints")
     parser.add_argument("--input-file", default="taai2019.txt")
-    cpu_count = os.cpu_count() or 1
-    parser.add_argument("--max-workers", type=int, default=min(cpu_count, 4))
+    parser.add_argument("--max-workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--slice-seconds", type=float, default=30)
     parser.add_argument("--max-rounds", type=int, default=10)
     parser.add_argument("--single", action="store_true", help="Solve only the first puzzle")
-    parser.add_argument("--prewarm", action="store_true", help="Precompute line patterns")
     args = parser.parse_args()
 
-    output_file = "result.txt"
+    output_file = "result_py.txt"
     checkpoint_dir = "checkpoints"
     ensure_checkpoint_dir(checkpoint_dir)
 
@@ -568,8 +566,8 @@ def main():
         print("No puzzles found.")
         return
 
-    if args.prewarm:
-        prewarm_patterns(puzzles)
+    # Precompute patterns for all line hints to warm caches (n=25).
+    prewarm_patterns(puzzles)
 
     solved = set()
     deferred = {}
