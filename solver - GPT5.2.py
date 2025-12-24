@@ -506,18 +506,20 @@ def solve_timeslice_worker(pid, col_hints, row_hints, state, slice_seconds):
     if state is not None:
         solver.load_state(state)
 
+    t0 = time.perf_counter()
     deadline = time.perf_counter() + slice_seconds
     status, payload = solver.solve_timeslice(deadline)
+    elapsed = time.perf_counter() - t0
 
     if status == "SOLVED":
         if verify_solution(payload, col_hints, row_hints):
-            return pid, "SOLVED", payload
-        return pid, "UNSOLVED", None
+            return pid, "SOLVED", payload, elapsed
+        return pid, "UNSOLVED", None, elapsed
 
     if status == "TIMEOUT":
-        return pid, "TIMEOUT", payload
+        return pid, "TIMEOUT", payload, elapsed
 
-    return pid, "UNSOLVED", None
+    return pid, "UNSOLVED", None, elapsed
 
 
 def write_solution(f_out, pid, grid):
@@ -565,6 +567,7 @@ def main():
 
     solved = set()
     deferred = {}
+    total_times = {}
 
     with open(output_file, "w", encoding="utf-8") as f_out:
         for round_idx in range(1, args.max_rounds + 1):
@@ -597,9 +600,11 @@ def main():
                 ]
 
                 for future in as_completed(futures):
-                    pid, status, payload = future.result()
+                    pid, status, payload, elapsed = future.result()
+                    total_times[pid] = total_times.get(pid, 0.0) + elapsed
                     if status == "SOLVED":
                         write_solution(f_out, pid, payload)
+                        print(f"{pid} solved in {total_times[pid]:.4f}s")
                         solved.add(pid)
                         path = checkpoint_path(checkpoint_dir, pid)
                         if os.path.exists(path):
@@ -611,12 +616,14 @@ def main():
                             pickle.dump(payload, f_cp)
                     else:
                         write_unsolved(f_out, pid)
+                        print(f"{pid} unsolved in {total_times[pid]:.4f}s")
                         solved.add(pid)
 
         for pid, state in deferred.items():
             if pid in solved:
                 continue
             write_unsolved(f_out, pid)
+            print(f"{pid} unsolved in {total_times.get(pid, 0.0):.4f}s")
 
 
 if __name__ == "__main__":
