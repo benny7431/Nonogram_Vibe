@@ -8,6 +8,7 @@
 #include <fstream>
 #include <future>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <list>
 #include <mutex>
@@ -699,7 +700,7 @@ static void ensure_checkpoint_dir(const string& path) {
 }
 
 static string checkpoint_path(const string& checkpoint_dir, const string& pid) {
-    return checkpoint_dir + "/" + pid + ".bin";
+    return checkpoint_dir + "/" + pid + ".pkl";
 }
 
 static void write_vector(ofstream& out, const vector<int>& vec) {
@@ -885,11 +886,10 @@ int main(int argc, char** argv) {
     CONSISTENT_CACHE = LRUCache<Key, vector<int>, KeyHash>(CONSISTENT_CACHE_SIZE);
 
     string input_file = "taai2019.txt";
-    int max_workers = static_cast<int>(min<unsigned>(thread::hardware_concurrency(), 4));
+    int max_workers = static_cast<int>(thread::hardware_concurrency());
     double slice_seconds = 30.0;
     int max_rounds = 10;
     bool single = false;
-    bool prewarm = false;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -898,7 +898,6 @@ int main(int argc, char** argv) {
         else if (arg == "--slice-seconds" && i + 1 < argc) slice_seconds = stod(argv[++i]);
         else if (arg == "--max-rounds" && i + 1 < argc) max_rounds = stoi(argv[++i]);
         else if (arg == "--single") single = true;
-        else if (arg == "--prewarm") prewarm = true;
     }
 
     if (max_workers < 1) max_workers = 1;
@@ -909,10 +908,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (prewarm) prewarm_patterns(puzzles);
+    prewarm_patterns(puzzles);
 
-    string output_file = "result_cpp.txt";
-    string checkpoint_dir = "checkpoints_cpp";
+    string output_file = "result_py.txt";
+    string checkpoint_dir = "checkpoints";
     ensure_checkpoint_dir(checkpoint_dir);
 
     unordered_map<string, NonogramSolver::State> deferred;
@@ -921,6 +920,8 @@ int main(int argc, char** argv) {
     for (const auto& p : puzzles) puzzle_map[p.pid] = p;
 
     ofstream fout(output_file);
+    cout.setf(ios::fixed);
+    cout << setprecision(4);
 
     for (int round_idx = 1; round_idx <= max_rounds; ++round_idx) {
         vector<pair<string, NonogramSolver::State*>> current;
