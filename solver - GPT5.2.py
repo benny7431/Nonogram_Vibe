@@ -1,6 +1,10 @@
+import argparse
+import os
+import pickle
 import sys
 import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
 
 # Constants
@@ -8,13 +12,19 @@ UNKNOWN = -1
 EMPTY = 0
 FILLED = 1
 
+# Result status
+SOLVED = "SOLVED"
+TIMEOUT = "TIMEOUT"
+UNSOLVABLE = "UNSOLVABLE"
+ERROR = "ERROR"
 
-def _hints_from_decided_line(line):
-    """Compute hints from a fully decided line containing only 0/1."""
+
+def _hints_from_decided_line(mask, n):
+    """Compute hints from a fully decided line bitmask."""
     out = []
     run = 0
-    for v in line:
-        if v == FILLED:
+    for i in range(n):
+        if mask & (1 << i):
             run += 1
         else:
             if run:
@@ -32,7 +42,6 @@ def _patterns_for_hints(n, hints):
     if not hints:
         return (0,)
 
-    # Precompute suffix sums for tight bounds.
     m = len(hints)
     suffix_sum = [0] * (m + 1)
     for i in range(m - 1, -1, -1):
@@ -46,7 +55,6 @@ def _patterns_for_hints(n, hints):
             return
 
         block_len = hints[i]
-        # Remaining blocks after i.
         rem_blocks = m - (i + 1)
         rem_min = suffix_sum[i + 1] + (rem_blocks if rem_blocks > 0 else 0)
         latest_start = n - (block_len + rem_min)
@@ -57,7 +65,6 @@ def _patterns_for_hints(n, hints):
         for start in range(pos, latest_start + 1):
             new_mask = mask | (block_bits << start)
             next_pos = start + block_len
-            # Mandatory separator if there are more blocks.
             if i + 1 < m:
                 next_pos += 1
             rec(next_pos, i + 1, new_mask)
@@ -66,8 +73,35 @@ def _patterns_for_hints(n, hints):
     return tuple(res)
 
 
+@lru_cache(maxsize=200000)
+def _consistent_masks(n, hints, must1, must0):
+    """Return tuple of all pattern masks consistent with must1/must0."""
+    fullmask = (1 << n) - 1
+    patterns = _patterns_for_hints(n, hints)
+    out = []
+    for mask in patterns:
+        if (mask & must0) != 0:
+            continue
+        if (mask & must1) != must1:
+            continue
+        out.append(mask)
+    return tuple(out)
+
+
+def _prewarm_patterns(n, hints_list):
+    for hints in hints_list:
+        _patterns_for_hints(n, tuple(hints))
+
+
 class NonogramSolver:
-    """Competition-style Nonogram solver: fast line filtering + MRV backtracking."""
+    """Nonogram solver with bitmask line filtering + iterative DFS stack.
+
+    State representation:
+    - row_filled/row_empty: per-row bitmask
+    - col_filled/col_empty: per-col bitmask
+    - trail: list of prior masks for undo
+    - stack: explicit DFS stack frames (r, c, choices, choice_index, trail_marker)
+    """
 
     def __init__(self, col_hints, row_hints):
         self.row_hints = [tuple(h) for h in row_hints]
@@ -78,106 +112,69 @@ class NonogramSolver:
         self.row_fullmask = (1 << self.width) - 1
         self.col_fullmask = (1 << self.height) - 1
 
-        # Grid: -1=Unknown, 0=Empty, 1=Filled
-        self.grid = [[UNKNOWN] * self.width for _ in range(self.height)]
+        self.row_filled = [0] * self.height
+        self.row_empty = [0] * self.height
+        self.col_filled = [0] * self.width
+        self.col_empty = [0] * self.width
 
-        # Cache of consistent masks per (n, hints, must1, must0)
-        self._consistent_cache = {}
+    def set_state(self, state):
+        self.row_filled = list(state["row_filled"])
+        self.row_empty = list(state["row_empty"])
+        self.col_filled = list(state["col_filled"])
+        self.col_empty = list(state["col_empty"])
 
-    def solve(self):
-        # Top-level propagate once. Keep changes on success.
-        trail = []
-        if not self.propagate(trail, queue=None):
-            self.undo(trail)
-            return None
-
-        if self._dfs():
-            return self.grid
-
-        # No solution found.
-        self.undo(trail)
-        return None
+    def get_state(self, trail, stack, need_new_guess, initialized):
+        return {
+            "row_filled": list(self.row_filled),
+            "row_empty": list(self.row_empty),
+            "col_filled": list(self.col_filled),
+            "col_empty": list(self.col_empty),
+            "trail": list(trail),
+            "stack": list(stack),
+            "need_new_guess": need_new_guess,
+            "initialized": initialized,
+        }
 
     def is_solved(self):
         for r in range(self.height):
-            if UNKNOWN in self.grid[r]:
+            if (self.row_filled[r] | self.row_empty[r]) != self.row_fullmask:
                 return False
         return True
 
     def set_cell(self, r, c, v, trail):
-        cur = self.grid[r][c]
-        if cur == v:
+        mask = 1 << c
+        rmask = 1 << r
+        row_filled = self.row_filled[r]
+        row_empty = self.row_empty[r]
+        col_filled = self.col_filled[c]
+        col_empty = self.col_empty[c]
+
+        if v == FILLED:
+            if row_empty & mask:
+                return False
+            if row_filled & mask:
+                return True
+            trail.append((r, c, row_filled, row_empty, col_filled, col_empty))
+            self.row_filled[r] = row_filled | mask
+            self.col_filled[c] = col_filled | rmask
             return True
-        if cur != UNKNOWN:
+
+        if row_filled & mask:
             return False
-        trail.append((r, c, cur))
-        self.grid[r][c] = v
+        if row_empty & mask:
+            return True
+        trail.append((r, c, row_filled, row_empty, col_filled, col_empty))
+        self.row_empty[r] = row_empty | mask
+        self.col_empty[c] = col_empty | rmask
         return True
 
-    def undo(self, trail):
-        while trail:
-            r, c, old = trail.pop()
-            self.grid[r][c] = old
-
-    def _line_to_constraints(self, line):
-        must1 = 0
-        must0 = 0
-        for i, v in enumerate(line):
-            bit = 1 << i
-            if v == FILLED:
-                must1 |= bit
-            elif v == EMPTY:
-                must0 |= bit
-        return must1, must0
-
-    def _consistent_masks(self, n, hints, must1, must0):
-        key = (n, hints, must1, must0)
-        cached = self._consistent_cache.get(key)
-        if cached is not None:
-            return cached
-
-        fullmask = (1 << n) - 1
-        patterns = _patterns_for_hints(n, hints)
-        out = []
-        for mask in patterns:
-            # filled cells cannot overlap must0; must1 must be subset of filled.
-            if (mask & must0) != 0:
-                continue
-            if (mask & must1) != must1:
-                continue
-            out.append(mask)
-
-        out = tuple(out)
-        self._consistent_cache[key] = out
-        return out
-
-    def solve_line(self, line, hints, n, fullmask):
-        """Return updated line list, or None on contradiction."""
-        # Fast contradiction on fully decided line.
-        if UNKNOWN not in line:
-            if tuple(_hints_from_decided_line(line)) != hints:
-                return None
-            return list(line)
-
-        must1, must0 = self._line_to_constraints(line)
-        masks = self._consistent_masks(n, hints, must1, must0)
-        if not masks:
-            return None
-
-        common1 = fullmask
-        common0 = fullmask
-        for m in masks:
-            common1 &= m
-            common0 &= (~m) & fullmask
-
-        out = list(line)
-        for i in range(n):
-            bit = 1 << i
-            if common1 & bit:
-                out[i] = FILLED
-            elif common0 & bit:
-                out[i] = EMPTY
-        return out
+    def undo_to(self, trail, marker):
+        while len(trail) > marker:
+            r, c, row_filled, row_empty, col_filled, col_empty = trail.pop()
+            self.row_filled[r] = row_filled
+            self.row_empty[r] = row_empty
+            self.col_filled[c] = col_filled
+            self.col_empty[c] = col_empty
 
     def propagate(self, trail, queue):
         """AC-style propagation on affected rows/cols. Records changes in trail."""
@@ -198,38 +195,82 @@ class NonogramSolver:
             is_row, idx = q.popleft()
             if is_row:
                 in_row[idx] = False
-                line = self.grid[idx]
-                hints = self.row_hints[idx]
-                n = self.width
-                fullmask = self.row_fullmask
-                new_line = self.solve_line(line, hints, n, fullmask)
-                if new_line is None:
+                must1 = self.row_filled[idx]
+                must0 = self.row_empty[idx]
+                if (must1 & must0) != 0:
+                    return False
+                masks = _consistent_masks(self.width, self.row_hints[idx], must1, must0)
+                if not masks:
                     return False
 
-                for c, (old, new) in enumerate(zip(line, new_line)):
-                    if old != new:
-                        if not self.set_cell(idx, c, new, trail):
-                            return False
-                        if not in_col[c]:
-                            q.append((False, c))
-                            in_col[c] = True
+                common1 = self.row_fullmask
+                common0 = self.row_fullmask
+                for m in masks:
+                    common1 &= m
+                    common0 &= (~m) & self.row_fullmask
+
+                unknown = ~(must1 | must0) & self.row_fullmask
+                new_filled = common1 & unknown
+                new_empty = common0 & unknown
+
+                while new_filled:
+                    bit = new_filled & -new_filled
+                    c = bit.bit_length() - 1
+                    if not self.set_cell(idx, c, FILLED, trail):
+                        return False
+                    if not in_col[c]:
+                        q.append((False, c))
+                        in_col[c] = True
+                    new_filled &= new_filled - 1
+
+                while new_empty:
+                    bit = new_empty & -new_empty
+                    c = bit.bit_length() - 1
+                    if not self.set_cell(idx, c, EMPTY, trail):
+                        return False
+                    if not in_col[c]:
+                        q.append((False, c))
+                        in_col[c] = True
+                    new_empty &= new_empty - 1
             else:
                 in_col[idx] = False
-                line = [self.grid[r][idx] for r in range(self.height)]
-                hints = self.col_hints[idx]
-                n = self.height
-                fullmask = self.col_fullmask
-                new_line = self.solve_line(line, hints, n, fullmask)
-                if new_line is None:
+                must1 = self.col_filled[idx]
+                must0 = self.col_empty[idx]
+                if (must1 & must0) != 0:
+                    return False
+                masks = _consistent_masks(self.height, self.col_hints[idx], must1, must0)
+                if not masks:
                     return False
 
-                for r, (old, new) in enumerate(zip(line, new_line)):
-                    if old != new:
-                        if not self.set_cell(r, idx, new, trail):
-                            return False
-                        if not in_row[r]:
-                            q.append((True, r))
-                            in_row[r] = True
+                common1 = self.col_fullmask
+                common0 = self.col_fullmask
+                for m in masks:
+                    common1 &= m
+                    common0 &= (~m) & self.col_fullmask
+
+                unknown = ~(must1 | must0) & self.col_fullmask
+                new_filled = common1 & unknown
+                new_empty = common0 & unknown
+
+                while new_filled:
+                    bit = new_filled & -new_filled
+                    r = bit.bit_length() - 1
+                    if not self.set_cell(r, idx, FILLED, trail):
+                        return False
+                    if not in_row[r]:
+                        q.append((True, r))
+                        in_row[r] = True
+                    new_filled &= new_filled - 1
+
+                while new_empty:
+                    bit = new_empty & -new_empty
+                    r = bit.bit_length() - 1
+                    if not self.set_cell(r, idx, EMPTY, trail):
+                        return False
+                    if not in_row[r]:
+                        q.append((True, r))
+                        in_row[r] = True
+                    new_empty &= new_empty - 1
 
         return True
 
@@ -237,62 +278,60 @@ class NonogramSolver:
         """MRV: pick the row/col with fewest consistent masks, then a good split cell."""
         best = None
 
-        # Rows
         for r in range(self.height):
-            line = self.grid[r]
-            if UNKNOWN not in line:
+            must1 = self.row_filled[r]
+            must0 = self.row_empty[r]
+            if (must1 | must0) == self.row_fullmask:
                 continue
-            must1, must0 = self._line_to_constraints(line)
-            masks = self._consistent_masks(self.width, self.row_hints[r], must1, must0)
+            masks = _consistent_masks(self.width, self.row_hints[r], must1, must0)
             if not masks:
                 return None
             if best is None or len(masks) < best[0]:
-                best = (len(masks), True, r, masks, line)
+                best = (len(masks), True, r, masks, must1, must0)
 
-        # Cols
         for c in range(self.width):
-            line = [self.grid[r][c] for r in range(self.height)]
-            if UNKNOWN not in line:
+            must1 = self.col_filled[c]
+            must0 = self.col_empty[c]
+            if (must1 | must0) == self.col_fullmask:
                 continue
-            must1, must0 = self._line_to_constraints(line)
-            masks = self._consistent_masks(self.height, self.col_hints[c], must1, must0)
+            masks = _consistent_masks(self.height, self.col_hints[c], must1, must0)
             if not masks:
                 return None
             if best is None or len(masks) < best[0]:
-                best = (len(masks), False, c, masks, line)
+                best = (len(masks), False, c, masks, must1, must0)
 
         if best is None:
             return None
 
-        _, is_row, idx, masks, line = best
+        _, is_row, idx, masks, must1, must0 = best
         total = len(masks)
 
-        # Pick a cell that splits masks near half.
         best_pos = None
         best_balance = None
         best_pref = None
 
         n = self.width if is_row else self.height
-        for pos in range(n):
-            if line[pos] != UNKNOWN:
-                continue
-            bit = 1 << pos
+        unknown = ~(must1 | must0) & ((1 << n) - 1)
+        pos = 0
+        while unknown:
+            bit = unknown & -unknown
+            pos = bit.bit_length() - 1
             cnt1 = 0
             for m in masks:
                 if m & bit:
                     cnt1 += 1
-            if cnt1 == 0 or cnt1 == total:
-                continue
-            balance = abs(2 * cnt1 - total)
-            if best_pos is None or balance < best_balance:
-                best_pos = pos
-                best_balance = balance
-                best_pref = FILLED if cnt1 * 2 >= total else EMPTY
+            if cnt1 != 0 and cnt1 != total:
+                balance = abs(2 * cnt1 - total)
+                if best_pos is None or balance < best_balance:
+                    best_pos = pos
+                    best_balance = balance
+                    best_pref = FILLED if cnt1 * 2 >= total else EMPTY
+            unknown &= unknown - 1
 
-        # Fallback if all unknown positions are forced in one direction (rare).
         if best_pos is None:
             for pos in range(n):
-                if line[pos] == UNKNOWN:
+                bit = 1 << pos
+                if (must1 | must0) & bit == 0:
                     best_pos = pos
                     best_pref = FILLED
                     break
@@ -304,37 +343,14 @@ class NonogramSolver:
 
         return (r, c, best_pref)
 
-    def _dfs(self):
-        if self.is_solved():
-            return True
-
-        choice = self._choose_guess()
-        if choice is None:
-            return False
-        r, c, pref = choice
-
-        for v in (pref, EMPTY if pref == FILLED else FILLED):
-            local_trail = []
-            if not self.set_cell(r, c, v, local_trail):
-                self.undo(local_trail)
-                continue
-
-            # Start propagation only from affected row/col.
-            q = deque()
-            in_row = [False] * self.height
-            in_col = [False] * self.width
-            q.append((True, r))
-            in_row[r] = True
-            q.append((False, c))
-            in_col[c] = True
-
-            if self.propagate(local_trail, (q, in_row, in_col)):
-                if self._dfs():
-                    return True
-
-            self.undo(local_trail)
-
-        return False
+    def to_grid(self):
+        grid = [[0] * self.width for _ in range(self.height)]
+        for r in range(self.height):
+            row_mask = self.row_filled[r]
+            for c in range(self.width):
+                if row_mask & (1 << c):
+                    grid[r][c] = FILLED
+        return grid
 
 
 def verify_solution(grid, col_hints, row_hints):
@@ -370,62 +386,286 @@ def verify_solution(grid, col_hints, row_hints):
     return True
 
 
+def _solve_timeslice(payload):
+    """Worker entry: solve one puzzle for a time slice and return status + checkpoint."""
+    pid = payload["pid"]
+    col_hints = payload["col_hints"]
+    row_hints = payload["row_hints"]
+    slice_seconds = payload["slice_seconds"]
+    state = payload["state"]
+
+    _prewarm_patterns(25, row_hints)
+    _prewarm_patterns(25, col_hints)
+
+    solver = NonogramSolver(col_hints, row_hints)
+
+    if state:
+        # Restore checkpoint: grid masks + DFS stack + undo trail.
+        solver.set_state(state)
+        trail = list(state["trail"])
+        stack = list(state["stack"])
+        need_new_guess = state["need_new_guess"]
+        initialized = state["initialized"]
+    else:
+        # New puzzle starts with empty masks and empty DFS stack.
+        trail = []
+        stack = []
+        need_new_guess = True
+        initialized = False
+
+    deadline = time.perf_counter() + slice_seconds
+    node_count = 0
+    check_interval = 256
+
+    if not initialized:
+        # Initial full propagation from empty grid (records in trail).
+        if not solver.propagate(trail, None):
+            return {"pid": pid, "status": UNSOLVABLE, "state": None, "solution": None}
+        initialized = True
+
+    while True:
+        node_count += 1
+        if node_count % check_interval == 0 and time.perf_counter() >= deadline:
+            checkpoint = solver.get_state(trail, stack, need_new_guess, initialized)
+            return {"pid": pid, "status": TIMEOUT, "state": checkpoint, "solution": None}
+
+        if solver.is_solved():
+            grid = solver.to_grid()
+            if verify_solution(grid, col_hints, row_hints):
+                return {"pid": pid, "status": SOLVED, "state": None, "solution": grid}
+            return {"pid": pid, "status": ERROR, "state": None, "solution": None}
+
+        if need_new_guess:
+            choice = solver._choose_guess()
+            if choice is None:
+                if not stack:
+                    return {"pid": pid, "status": UNSOLVABLE, "state": None, "solution": None}
+                stack[-1][3] += 1
+                need_new_guess = False
+                continue
+            r, c, pref = choice
+            other = EMPTY if pref == FILLED else FILLED
+            stack.append([r, c, [pref, other], 0, len(trail)])
+            need_new_guess = False
+
+        if not stack:
+            return {"pid": pid, "status": UNSOLVABLE, "state": None, "solution": None}
+
+        r, c, choices, idx, marker = stack[-1]
+        if idx >= len(choices):
+            stack.pop()
+            solver.undo_to(trail, marker)
+            if not stack:
+                return {"pid": pid, "status": UNSOLVABLE, "state": None, "solution": None}
+            stack[-1][3] += 1
+            need_new_guess = False
+            continue
+
+        solver.undo_to(trail, marker)
+        if time.perf_counter() >= deadline:
+            checkpoint = solver.get_state(trail, stack, need_new_guess, initialized)
+            return {"pid": pid, "status": TIMEOUT, "state": checkpoint, "solution": None}
+
+        v = choices[idx]
+        if not solver.set_cell(r, c, v, trail):
+            stack[-1][3] += 1
+            continue
+
+        q = deque()
+        in_row = [False] * solver.height
+        in_col = [False] * solver.width
+        q.append((True, r))
+        in_row[r] = True
+        q.append((False, c))
+        in_col[c] = True
+
+        if not solver.propagate(trail, (q, in_row, in_col)):
+            solver.undo_to(trail, marker)
+            stack[-1][3] += 1
+            continue
+
+        need_new_guess = True
+
+
 def parse_line(line):
-    return list(map(int, line.replace('.', ' ').strip().split()))
+    return list(map(int, line.replace(".", " ").strip().split()))
+
+
+def read_puzzles(input_file):
+    with open(input_file, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    puzzles = []
+    idx = 0
+    while idx < len(lines):
+        if lines[idx].startswith("$"):
+            pid = lines[idx]
+            idx += 1
+
+            col_hints = []
+            for _ in range(25):
+                if idx < len(lines):
+                    col_hints.append(parse_line(lines[idx]))
+                    idx += 1
+
+            row_hints = []
+            for _ in range(25):
+                if idx < len(lines):
+                    row_hints.append(parse_line(lines[idx]))
+                    idx += 1
+
+            puzzles.append((pid, col_hints, row_hints))
+        else:
+            idx += 1
+    return puzzles
+
+
+def write_solution(f_out, pid, grid):
+    f_out.write(f"{pid}\n")
+    for row in grid:
+        f_out.write("  ".join("1" if cell == FILLED else "0" for cell in row) + "\n")
+    f_out.flush()
+
+
+def write_unsolved(f_out, pid):
+    f_out.write(f"{pid}\n")
+    f_out.write("Unsolvable or Timeout\n")
+    f_out.flush()
+
+
+def save_checkpoint(pid, state, checkpoint_dir):
+    """Checkpoint format: pickle of state dict for a puzzle id."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, f"{pid}.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(state, f)
+    return path
+
+
+def load_checkpoint(pid, checkpoint_dir):
+    path = os.path.join(checkpoint_dir, f"{pid}.pkl")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def solve_all(
+    puzzles,
+    output_file,
+    max_workers,
+    slice_seconds,
+    max_rounds,
+    checkpoint_dir,
+):
+    """Parallel workflow:
+    1) Submit every puzzle with a fixed time slice to the process pool.
+    2) TIMEOUT -> save checkpoint + enqueue for the next round.
+    3) SOLVED -> verify and immediately append to result.txt.
+    4) After max_rounds, mark remaining puzzles as unsolved.
+    """
+    with open(output_file, "w", encoding="utf-8") as f_out:
+        f_out.write("")
+
+    pending = [
+        {"pid": pid, "col_hints": col_hints, "row_hints": row_hints, "state": None, "rounds": 0}
+        for pid, col_hints, row_hints in puzzles
+    ]
+
+    solved = set()
+    unsolved = set()
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor, open(
+        output_file, "a", encoding="utf-8"
+    ) as f_out:
+        for round_idx in range(1, max_rounds + 1):
+            if not pending:
+                break
+
+            futures = {}
+            for item in pending:
+                payload = {
+                    "pid": item["pid"],
+                    "col_hints": item["col_hints"],
+                    "row_hints": item["row_hints"],
+                    "slice_seconds": slice_seconds,
+                    "state": item["state"],
+                }
+                futures[executor.submit(_solve_timeslice, payload)] = item
+
+            next_pending = []
+            for fut in as_completed(futures):
+                item = futures[fut]
+                pid = item["pid"]
+                try:
+                    result = fut.result()
+                except Exception:
+                    result = {"pid": pid, "status": ERROR, "state": None, "solution": None}
+
+                status = result["status"]
+                if status == SOLVED:
+                    write_solution(f_out, pid, result["solution"])
+                    solved.add(pid)
+                elif status == TIMEOUT:
+                    checkpoint = result["state"]
+                    save_checkpoint(pid, checkpoint, checkpoint_dir)
+                    item["state"] = checkpoint
+                    item["rounds"] += 1
+                    next_pending.append(item)
+                elif status == UNSOLVABLE:
+                    write_unsolved(f_out, pid)
+                    unsolved.add(pid)
+                else:
+                    item["state"] = result.get("state")
+                    item["rounds"] += 1
+                    next_pending.append(item)
+
+            pending = next_pending
+
+        for item in pending:
+            pid = item["pid"]
+            if pid in solved or pid in unsolved:
+                continue
+            write_unsolved(f_out, pid)
 
 
 def main():
-    input_file = 'taai2019.txt'
-    output_file = 'result_py.txt'
+    # Self-test examples:
+    # 1) Single puzzle: python solver - GPT5.2.py --single
+    # 2) Full run: python solver - GPT5.2.py
+    # 3) Checkpoint recovery: python solver - GPT5.2.py --slice-seconds 0.01 --max-rounds 1
+    #    Then re-run with larger slice to finish.
+    parser = argparse.ArgumentParser(description="Nonogram solver with checkpoints and multiprocessing.")
+    parser.add_argument("--input", default="taai2019.txt", help="input file path")
+    parser.add_argument("--output", default="result.txt", help="output file path (fixed to result.txt)")
+    parser.add_argument("--max-workers", type=int, default=os.cpu_count(), help="max worker processes")
+    parser.add_argument("--slice-seconds", type=float, default=30.0, help="seconds per time slice")
+    parser.add_argument("--max-rounds", type=int, default=10, help="max rounds for deferred puzzles")
+    parser.add_argument("--single", action="store_true", help="solve only the first puzzle")
+    parser.add_argument(
+        "--checkpoint-dir", default="checkpoints", help="checkpoint directory (default: checkpoints)"
+    )
+    args = parser.parse_args()
 
-    try:
-        with open(input_file, 'r', encoding='utf-8') as f:
-            lines = [line.strip() for line in f if line.strip()]
-    except FileNotFoundError:
-        print(f"Error: {input_file} not found.")
+    if args.output != "result.txt":
+        args.output = "result.txt"
+
+    if not os.path.exists(args.input):
+        print(f"Error: {args.input} not found.")
         return
 
-    with open(output_file, 'w', encoding='utf-8') as f_out:
-        idx = 0
-        while idx < len(lines):
-            if lines[idx].startswith('$'):
-                pid = lines[idx]
-                idx += 1
+    puzzles = read_puzzles(args.input)
+    if args.single and puzzles:
+        puzzles = [puzzles[0]]
 
-                col_hints = []
-                for _ in range(25):
-                    if idx < len(lines):
-                        col_hints.append(parse_line(lines[idx]))
-                        idx += 1
-
-                row_hints = []
-                for _ in range(25):
-                    if idx < len(lines):
-                        row_hints.append(parse_line(lines[idx]))
-                        idx += 1
-
-                print(f"Solving {pid}...", end=" ", flush=True)
-                t0 = time.time()
-
-                solver = NonogramSolver(col_hints, row_hints)
-                sol = solver.solve()
-
-                t1 = time.time()
-
-                is_correct = False
-                if sol:
-                    is_correct = verify_solution(sol, col_hints, row_hints)
-
-                print(f"Done. Time: {t1 - t0:.4f}s. Correct: {is_correct}")
-
-                f_out.write(f"{pid}\n")
-                if sol and is_correct:
-                    for row in sol:
-                        f_out.write("  ".join("1" if cell == FILLED else "0" for cell in row) + "\n")
-                else:
-                    f_out.write("Unsolvable or Error\n")
-            else:
-                idx += 1
+    solve_all(
+        puzzles=puzzles,
+        output_file=args.output,
+        max_workers=args.max_workers,
+        slice_seconds=args.slice_seconds,
+        max_rounds=args.max_rounds,
+        checkpoint_dir=args.checkpoint_dir,
+    )
 
 
 if __name__ == "__main__":
