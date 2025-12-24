@@ -889,7 +889,8 @@ WorkerResult SolveTimesliceWorker(const std::string& pid,
   }
 
   auto t0 = std::chrono::steady_clock::now();
-  auto deadline = t0 + std::chrono::duration<double>(slice_seconds);
+  auto deadline = t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(slice_seconds));
   auto [status, payload] = solver.SolveTimeslice(deadline);
   auto elapsed =
       std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() -
