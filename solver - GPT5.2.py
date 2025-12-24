@@ -12,8 +12,11 @@ UNKNOWN = -1
 EMPTY = 0
 FILLED = 1
 
+PATTERN_CACHE_SIZE = int(os.getenv("NONO_PATTERN_CACHE", "20000"))
+CONSISTENT_CACHE_SIZE = int(os.getenv("NONO_CONSISTENT_CACHE", "50000"))
 
-@lru_cache(maxsize=None)
+
+@lru_cache(maxsize=PATTERN_CACHE_SIZE)
 def _patterns_for_hints(n, hints):
     """Return tuple of filled-cell bitmasks for all placements of hints on length n."""
     hints = tuple(hints)
@@ -51,7 +54,7 @@ def _patterns_for_hints(n, hints):
     return tuple(res)
 
 
-@lru_cache(maxsize=200000)
+@lru_cache(maxsize=CONSISTENT_CACHE_SIZE)
 def _consistent_masks_cached(n, hints, must1, must0):
     """LRU cached consistent masks for (n, hints, must1, must0)."""
     fullmask = (1 << n) - 1
@@ -548,13 +551,13 @@ def checkpoint_path(checkpoint_dir, pid):
 def main():
     parser = argparse.ArgumentParser(description="Nonogram solver with time slicing + checkpoints")
     parser.add_argument("--input-file", default="taai2019.txt")
-    parser.add_argument("--max-workers", type=int, default=os.cpu_count())
+    parser.add_argument("--max-workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--slice-seconds", type=float, default=30)
     parser.add_argument("--max-rounds", type=int, default=10)
     parser.add_argument("--single", action="store_true", help="Solve only the first puzzle")
     args = parser.parse_args()
 
-    output_file = "result.txt"
+    output_file = "result_py.txt"
     checkpoint_dir = "checkpoints"
     ensure_checkpoint_dir(checkpoint_dir)
 
@@ -563,6 +566,7 @@ def main():
         print("No puzzles found.")
         return
 
+    # Precompute patterns for all line hints to warm caches (n=25).
     prewarm_patterns(puzzles)
 
     solved = set()
