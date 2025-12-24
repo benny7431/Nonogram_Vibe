@@ -3,6 +3,7 @@ import time
 import sys
 import os
 import platform
+import shutil
 
 # 設定要執行的檔案 (可以是 .py 或 .cpp)
 SOLVER_FILE = 'solver - GPT5.2.py'
@@ -16,8 +17,27 @@ def compile_cpp(cpp_file):
         exe_file += ".exe"
     
     print(f"Compiling {cpp_file}...")
-    # 使用 g++ 編譯，開啟 O3 優化
-    compile_cmd = ["g++", "-O3", cpp_file, "-o", exe_file]
+    # 使用可用的編譯器，預設 g++，支援 CXX 環境變數
+    compiler = os.environ.get("CXX")
+    candidates = [compiler, "g++", "clang++", "cl"]
+    compiler = next((c for c in candidates if c and shutil.which(c)), None)
+    if not compiler:
+        print("Compilation failed: no C++ compiler found. Set CXX or install g++/clang++/cl.")
+        return None
+
+    if compiler == "cl":
+        compile_cmd = [
+            "cmd",
+            "/c",
+            "cl",
+            "/nologo",
+            "/O2",
+            "/EHsc",
+            cpp_file,
+            f"/Fe:{exe_file}",
+        ]
+    else:
+        compile_cmd = [compiler, "-O3", "-std=c++17", cpp_file, "-o", exe_file]
     try:
         subprocess.check_call(compile_cmd)
         print("Compilation successful.")
