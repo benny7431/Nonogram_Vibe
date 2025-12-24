@@ -87,6 +87,7 @@ public:
     LRUCache(size_t cap) : capacity(cap) {}
 
     bool get(const K& key, V& out) {
+        lock_guard<mutex> lock(mu);
         auto it = mp.find(key);
         if (it == mp.end()) return false;
         lst.splice(lst.begin(), lst, it->second);
@@ -95,6 +96,7 @@ public:
     }
 
     void put(const K& key, const V& val) {
+        lock_guard<mutex> lock(mu);
         auto it = mp.find(key);
         if (it != mp.end()) {
             it->second->second = val;
@@ -114,6 +116,7 @@ private:
     size_t capacity;
     list<pair<K, V>> lst;
     unordered_map<K, typename list<pair<K, V>>::iterator, Hash> mp;
+    mutex mu;
 };
 
 static LRUCache<Key, vector<int>, KeyHash> CONSISTENT_CACHE(50000);
