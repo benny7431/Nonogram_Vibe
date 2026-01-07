@@ -8,6 +8,7 @@
 #include <fstream>
 #include <future>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <list>
 #include <mutex>
@@ -86,6 +87,7 @@ public:
     LRUCache(size_t cap) : capacity(cap) {}
 
     bool get(const K& key, V& out) {
+        lock_guard<mutex> lock(mu);
         auto it = mp.find(key);
         if (it == mp.end()) return false;
         lst.splice(lst.begin(), lst, it->second);
@@ -94,6 +96,7 @@ public:
     }
 
     void put(const K& key, const V& val) {
+        lock_guard<mutex> lock(mu);
         auto it = mp.find(key);
         if (it != mp.end()) {
             it->second->second = val;
@@ -113,6 +116,7 @@ private:
     size_t capacity;
     list<pair<K, V>> lst;
     unordered_map<K, typename list<pair<K, V>>::iterator, Hash> mp;
+    mutex mu;
 };
 
 static LRUCache<Key, vector<int>, KeyHash> CONSISTENT_CACHE(50000);
@@ -699,7 +703,7 @@ static void ensure_checkpoint_dir(const string& path) {
 }
 
 static string checkpoint_path(const string& checkpoint_dir, const string& pid) {
-    return checkpoint_dir + "/" + pid + ".bin";
+    return checkpoint_dir + "/" + pid + ".pkl";
 }
 
 static void write_vector(ofstream& out, const vector<int>& vec) {
@@ -720,6 +724,10 @@ static void read_vector(ifstream& in, vector<int>& vec) {
 }
 
 static void write_state(ofstream& out, const NonogramSolver::State& state) {
+    uint32_t magic = 0x4e4f4e4f; // "NONO"
+    uint32_t version = 1;
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(uint32_t));
+    out.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
     write_vector(out, state.row_must1);
     write_vector(out, state.row_must0);
     write_vector(out, state.col_must1);
@@ -747,6 +755,11 @@ static void write_state(ofstream& out, const NonogramSolver::State& state) {
 
 static bool read_state(ifstream& in, NonogramSolver::State& state) {
     if (!in.good()) return false;
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    in.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
+    in.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+    if (!in.good() || magic != 0x4e4f4e4f || version != 1) return false;
     read_vector(in, state.row_must1);
     read_vector(in, state.row_must0);
     read_vector(in, state.col_must1);
@@ -885,11 +898,10 @@ int main(int argc, char** argv) {
     CONSISTENT_CACHE = LRUCache<Key, vector<int>, KeyHash>(CONSISTENT_CACHE_SIZE);
 
     string input_file = "taai2019.txt";
-    int max_workers = static_cast<int>(min<unsigned>(thread::hardware_concurrency(), 4));
+    int max_workers = static_cast<int>(thread::hardware_concurrency());
     double slice_seconds = 30.0;
     int max_rounds = 10;
     bool single = false;
-    bool prewarm = false;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -898,7 +910,6 @@ int main(int argc, char** argv) {
         else if (arg == "--slice-seconds" && i + 1 < argc) slice_seconds = stod(argv[++i]);
         else if (arg == "--max-rounds" && i + 1 < argc) max_rounds = stoi(argv[++i]);
         else if (arg == "--single") single = true;
-        else if (arg == "--prewarm") prewarm = true;
     }
 
     if (max_workers < 1) max_workers = 1;
@@ -909,10 +920,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (prewarm) prewarm_patterns(puzzles);
+    prewarm_patterns(puzzles);
 
-    string output_file = "result_cpp.txt";
-    string checkpoint_dir = "checkpoints_cpp";
+    string output_file = "result_py.txt";
+    string checkpoint_dir = "checkpoints";
     ensure_checkpoint_dir(checkpoint_dir);
 
     unordered_map<string, NonogramSolver::State> deferred;
@@ -921,6 +932,8 @@ int main(int argc, char** argv) {
     for (const auto& p : puzzles) puzzle_map[p.pid] = p;
 
     ofstream fout(output_file);
+    cout.setf(ios::fixed);
+    cout << setprecision(4);
 
     for (int round_idx = 1; round_idx <= max_rounds; ++round_idx) {
         vector<pair<string, NonogramSolver::State*>> current;
